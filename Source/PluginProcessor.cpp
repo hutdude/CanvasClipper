@@ -23,20 +23,28 @@ CanvasClipperAudioProcessor::CanvasClipperAudioProcessor()
     )
 #endif 
     , state(*this, nullptr, "STATE", {
-        std::make_unique<juce::AudioParameterFloat>(
-            "inputGain",
-            "Input Gain",
-            juce::NormalisableRange<float>(-24.0f, 24.0f, 0.0f, 1.0f),
-            0.0f,
-            "dB"
-        ),
-        std::make_unique<juce::AudioParameterChoice>(
-            "type",
-            "Type",
-            juce::StringArray{ "Soft", "Hard"},
-            0
-        ),
-           
+
+        // user controlled variables
+        std::make_unique<juce::AudioParameterFloat>("inputGain", "Input Gain", juce::NormalisableRange<float>(0.f, 18.0f, .1f, 1.0f),0.0f, "dB"),
+        std::make_unique<juce::AudioParameterFloat>("outputGain", "Output Gain", juce::NormalisableRange<float>(-18.f, 12.0f, .5f, 1.0f), 0.0f, "dB"),
+        std::make_unique<juce::AudioParameterChoice>("saturationType", "Saturation Type", juce::StringArray{ "Soft", "Hard"}, 0),
+        std::make_unique<juce::AudioParameterChoice>("analogType", "Analog Type", juce::StringArray{ "None", "Transformer", "Tape"}, 0),
+        std::make_unique<juce::AudioParameterBool>("analogDrive", "Analog Drive", false),
+        std::make_unique<juce::AudioParameterChoice>("os", "Over Sampling", juce::StringArray{ "None", "2x", "4x"}, 0),
+        
+        // experiemental variables - to be removed eventually
+        std::make_unique<juce::AudioParameterFloat>("softLimitCoefficient","softLimitCoefficient",juce::NormalisableRange<float>(1.0f, 10.0f, .1f, 1.f), 1.0f),
+        std::make_unique<juce::AudioParameterFloat>("transformerize", "transformerize", juce::NormalisableRange<float>(0.f, 1.0f, .1f, 1.f),0.1f),
+        std::make_unique<juce::AudioParameterFloat>("evenAmount", "evenAmount", juce::NormalisableRange<float>(0.f, 1.0f, .1f, 1.f),0.f),
+
+        // neve style preamp variables:
+        // A_mix sets the ratio of clean signal to clipped in the soft clipper and defaults to 0.04. That is about what the Waves Omega-N sets it to
+        // A_v is the amount of gain pushed into the clipped signal. Right now it is somehwhat but not completely redunant with input gain.
+        // I tried adding a DC offset to allow for introduction of even-order harmonics but it doesn't sound great yet
+        std::make_unique<juce::AudioParameterFloat>("A_mix", "A_mix", juce::NormalisableRange<float>(0.f, 1.0f, .01f, 1.f),0.04f),  
+        std::make_unique<juce::AudioParameterFloat>("A_v", "A_v", juce::NormalisableRange<float>(0.f, 50.0f, 1.f, 1.f),0.f),
+        std::make_unique<juce::AudioParameterFloat>("dcOffset", "DC Offset", juce::NormalisableRange<float>(0.f, 1.0f, .01f, 1.f), 0.0f),
+
         })
 {
 }
@@ -110,8 +118,12 @@ void CanvasClipperAudioProcessor::changeProgramName(int index, const juce::Strin
 //==============================================================================
 void CanvasClipperAudioProcessor::prepareToPlay(double sampleRate, int samplesPerBlock)
 {
-    // Use this method as the place to do any pre-playback
-    // initialisation that you need..
+
+    juce::dsp::ProcessSpec spec;
+    spec.sampleRate = sampleRate;
+    spec.maximumBlockSize = samplesPerBlock;
+    spec.numChannels = getTotalNumInputChannels();
+
 }
 
 void CanvasClipperAudioProcessor::releaseResources()
@@ -146,6 +158,7 @@ bool CanvasClipperAudioProcessor::isBusesLayoutSupported(const BusesLayout& layo
 }
 #endif
 
+
 void CanvasClipperAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
 {
     juce::ScopedNoDenormals noDenormals;
@@ -153,49 +166,66 @@ void CanvasClipperAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
     auto totalNumOutputChannels = getTotalNumOutputChannels();
 
     // user specified parameters
-    float inputGainDB = state.getParameter("inputGain")->getValue();
+    float inputGainDB = *state.getRawParameterValue("inputGain");  
     float inputGainLinear = std::pow(10.0f, inputGainDB / 20.0f);  // converting from db to gain
-    bool gainMatch = state.getParameter("gainMatch")->getValue();
 
-    
+    float outputGainDB = *state.getRawParameterValue("outputGain");
+    float outputGainLinear = std::pow(10.0f, outputGainDB / 20.f); 
 
-    // Process the audio
+    float transformerizeCoefficient = *state.getRawParameterValue("transformerize");
+
+    float A_mix = *state.getRawParameterValue("A_mix");
+    float A_v = *state.getRawParameterValue("A_v");
+    float dcOffset = *state.getRawParameterValue("dcOffset");
+
+    float softLimitCoefficient = *state.getRawParameterValue("softLimitCoefficient");
+    int os = state.getParameter("os")->getValue();
+
+    float evenAmount = *state.getRawParameterValue("evenAmount");
+
+
     for (int channel = 0; channel < totalNumInputChannels; ++channel)
     {
         auto* channelData = buffer.getWritePointer(channel);
 
-        // account for user input gain
-        for (int i = 0; i < buffer.getNumSamples(); ++i)
-        {
-            channelData[i] *= inputGainLinear;
-        }
-
-        auto* typeParam = dynamic_cast<juce::AudioParameterChoice*>(state.getParameter("type"));
+        auto* typeParam = dynamic_cast<juce::AudioParameterChoice*>(state.getParameter("saturationType"));
         if (typeParam != nullptr)
         {
             juce::String type = typeParam->getCurrentChoiceName();
 
-            if (type == "Soft")
+            // Process each sample
+            for (int i = 0; i < buffer.getNumSamples(); ++i)
             {
-                // this is where we can change reponse of soft clipper. If the function is changed from tanh, the response will be changed
-                for (int i = 0; i < buffer.getNumSamples(); ++i)
+                // INPUT GAIN STAGE 
+                float sample = channelData[i] * inputGainLinear;
+
+                // CLIPPING STAGE
+
+                if (type == "Soft")
                 {
-                    channelData[i] = std::tanh(channelData[i]);
+                    // Add DC offset  
+                    float dcShifted = sample + dcOffset;
+
+                    float soft_saturation = sample + A_mix * std::tanh(A_v * sample);
+
+                    // Remove DC offset 
+                    sample = soft_saturation - dcOffset;
                 }
-            }
-            else if (type == "Hard")
-            {
-                // Lop that shit off at 1.0
-                for (int i = 0; i < buffer.getNumSamples(); ++i)
+                else if (type == "Hard")
                 {
-                    channelData[i] = std::clamp(channelData[i], -1.0f, 1.0f);
+                    // lop that ish off at 1.0
+                    sample = std::max(-1.0f, std::min(1.0f, sample));
                 }
+                // ANALOG STAGE
+
+
+                //OUTPUT GAIN STAGE
+                sample *= outputGainLinear;
+
+                channelData[i] = sample;
             }
         }
     }
-
-
-   
 
     // Clear any extra output channels
     for (auto i = totalNumInputChannels; i < totalNumOutputChannels; ++i)

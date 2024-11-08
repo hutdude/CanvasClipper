@@ -54,15 +54,14 @@ public:
     void getStateInformation (juce::MemoryBlock& destData) override;
     void setStateInformation (const void* data, int sizeInBytes) override;
 
+
+
 private:
     //==============================================================================
 
     juce::AudioProcessorValueTreeState state;
 
-    // float smoothedGainCompensation = 1.0f;
-    //const float smoothingCoeff = 0.995f; // changes smoothign amount for gain match
-    int oversamplingFactor = 0;
-    std::unique_ptr<juce::dsp::Oversampling<float>> oversampling;
+
 
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (CanvasClipperAudioProcessor)
